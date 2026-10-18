@@ -1,0 +1,215 @@
+name: postgresql-client
+title: PostgreSQL client tools
+summary: Queries PostgreSQL servers with psql and backs up and restores databases with pg_dump, pg_restore and pg_basebackup. Built from the PostgreSQL source release.
+homepage: https://www.postgresql.org/
+# PostgreSQL is under the PostgreSQL License. Code compiled into the tools
+# comes under other terms too: snprintf.c, pgmkdirp.c, bsearch_arg.c and the
+# qsort template (BSD-3-Clause), inet_net_ntop.c and timingsafe_bcmp.c (ISC),
+# the fasthash code in pg_dumpall, pg_verifybackup and pg_combinebackup and
+# the CRC-32C code in src/port that was generated with fast-crc32 (MIT), the
+# tables in libpq and psql that are generated from the Unicode Character
+# Database (Unicode-3.0), the archive code of pg_dump and pg_restore, which
+# Philip Warner released on the condition that his notice is kept
+# (LicenseRef-pg-dump), and Markus Kuhn's wcwidth code in libpq and Bob
+# Jenkins' hash function in pg_dump (LicenseRef-Public-Domain). pgbench's
+# expression parser and the psql and pgbench scanners are generated during
+# the build by the distro's Bison and flex. The Bison exception lets the
+# parser be used under any terms, and flex output carries no license terms.
+license: PostgreSQL AND BSD-3-Clause AND ISC AND MIT AND Unicode-3.0 AND LicenseRef-pg-dump AND LicenseRef-Public-Domain
+upstream:
+  source: html-index
+  url: https://ftp.postgresql.org/pub/source/
+  # Each release has a directory v<major>.<minor>/, which appears when the
+  # release is announced; the tarballs in it are dated a few days earlier,
+  # when they were made. Betas and release candidates (v19beta4, v19rc1) do
+  # not match, and a version withdrawn before its announcement never gets a
+  # directory. The index gives no time zone.
+  pattern: 'href="v(?P<version>\d+\.\d+)/">[^<]*</a> +(?P<date>\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2})'
+  versioning: semver
+  version: "18.6"
+  cooldown: 48h
+  artifact:
+    url: https://ftp.postgresql.org/pub/source/v{version}/postgresql-{version}.tar.bz2
+    checksums:
+      url: https://ftp.postgresql.org/pub/source/v{version}/postgresql-{version}.tar.bz2.sha256
+      algorithm: sha256
+    sha256: 555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f
+image:
+  entrypoint: [psql]
+  cmd: [--help]
+  # libpq and psql read ~/.pgpass, ~/.pg_service.conf, ~/.psqlrc and
+  # ~/.postgresql/, and psql keeps its history in ~/.psql_history. /cache is
+  # writable for any user.
+  env:
+    HOME: /cache
+test:
+  - |
+    test "$HOME" = /cache || { echo "HOME is $HOME, expected /cache" >&2; exit 1; }
+    for tool in clusterdb createdb createuser dropdb dropuser pg_amcheck pg_basebackup \
+        pg_combinebackup pg_dump pg_dumpall pg_isready pg_receivewal pg_recvlogical pg_restore \
+        pg_verifybackup pg_waldump pgbench psql reindexdb vacuumdb; do
+      "$tool" --version > version.txt
+      if [ "$(cat version.txt)" != "$tool (PostgreSQL) $VERSION" ]; then
+        echo "expected: $tool (PostgreSQL) $VERSION" >&2
+        echo "got: $(cat version.txt)" >&2
+        exit 1
+      fi
+    done
+    # The server and its tools are not part of the image, and neither is
+    # pg_config, which describes headers the image does not have.
+    for tool in initdb pg_config pg_createsubscriber pg_ctl postgres; do
+      if command -v "$tool" > /dev/null; then echo "$tool should not be in the image" >&2; exit 1; fi
+    done
+  - |
+    # psql edits lines with libedit, never GNU readline. The programs load
+    # libpq from /usr/local/lib, and libpq links OpenSSL and GSSAPI.
+    needs() {
+      ldd "$1" > ldd.txt 2>&1 || { cat ldd.txt >&2; exit 1; }
+      shift
+      for lib in "$@"; do
+        grep -Eq "^[[:space:]]+$lib" ldd.txt || { cat ldd.txt >&2; echo "missing: $lib" >&2; exit 1; }
+      done
+    }
+    needs /usr/local/bin/psql 'libpq\.so\.5 => /usr/local/lib/libpq\.so\.5 ' 'libedit\.so\.'
+    if grep -q 'libreadline' ldd.txt; then cat ldd.txt >&2; exit 1; fi
+    needs /usr/local/bin/pg_dump 'libpq\.so\.5 => /usr/local/lib/' 'liblz4\.so\.1 ' 'libzstd\.so\.1 ' 'libz\.so\.1 '
+    needs /usr/local/bin/pg_basebackup 'liblz4\.so\.1 ' 'libzstd\.so\.1 ' 'libz\.so\.1 '
+    needs /usr/local/lib/libpq.so.5 'libssl\.so\.3 ' 'libcrypto\.so\.3 ' 'libgssapi_krb5\.so\.2 '
+  - |
+    # No server runs in the container, so every connection fails. The errors
+    # show the compiled-in defaults, and that options which need OpenSSL,
+    # GSSAPI or a compression library are accepted. A user is given because
+    # libpq needs one, and the test UID may have no account in the image.
+    rc=0
+    pg_isready -h 127.0.0.1 -p 9 -U test > isready.txt || rc=$?
+    if [ "$rc" != 2 ] || [ "$(cat isready.txt)" != '127.0.0.1:9 - no response' ]; then
+      echo "pg_isready exited with $rc:" >&2; cat isready.txt >&2; exit 1
+    fi
+    fails() {
+      rc=0
+      "$@" > out.txt 2>&1 || rc=$?
+      if [ "$rc" = 0 ] || ! grep -Fq "$expected" out.txt; then
+        echo "$*: expected an error with: $expected" >&2; echo "got ($rc):" >&2; cat out.txt >&2; exit 1
+      fi
+    }
+    expected='connection to server on socket "/tmp/.s.PGSQL.5432" failed: No such file or directory'
+    fails psql -X -U test -c 'select 1'
+    expected='connection to server on socket "/work/.s.PGSQL.5432" failed: No such file or directory'
+    fails psql -X -h /work -U test -c 'select 1'
+    expected='connection to server at "127.0.0.1", port 9 failed: Connection refused'
+    fails psql -X -d 'host=127.0.0.1 port=9 user=test sslmode=require' -c 'select 1'
+    for method in gzip lz4 zstd; do
+      fails pg_dump -h 127.0.0.1 -p 9 -U test -Fc -Z "$method" -f never.dump shop
+    done
+    expected='GSSAPI encryption required but no credential cache'
+    fails psql -X -d 'host=127.0.0.1 port=9 user=test gssencmode=require' -c 'select 1'
+  - |
+    # One table with three rows as pg_dump custom-format archives, one per
+    # compression method. Only the compression byte of the header and the
+    # data block differ between them.
+    base64 -d > toc.bin <<'EOF'
+    AAAAAAAAHgAAAAAJAAAAAA4AAAAACQAAAAB+AAAAAAAAAAAABAAAAHNob3AABAAAADE4LjYABAAA
+    ADE4LjYABgAAAAABAAAAAAAAAAAAAQAAADAAAQAAADAACAAAAEVOQ09ESU5HAAgAAABFTkNPRElO
+    RwACAAAAAB4AAABTRVQgY2xpZW50X2VuY29kaW5nID0gJ1VURjgnOwoBAQAAAAEBAAAAAQEAAAAB
+    AQAAAAEBAAAAAAAAAAABAQAAAAAFAAAAZmFsc2UBAQAAAAMAAAAAAAAAAAACAAAAAAAAAAAAAQAA
+    ADAAAQAAADAACgAAAFNURFNUUklOR1MACgAAAFNURFNUUklOR1MAAgAAAAAoAAAAU0VUIHN0YW5k
+    YXJkX2NvbmZvcm1pbmdfc3RyaW5ncyA9ICdvbic7CgEBAAAAAQEAAAABAQAAAAEBAAAAAQEAAAAA
+    AAAAAAEBAAAAAAUAAABmYWxzZQEBAAAAAwAAAAAAAAAAAAMAAAAAAAAAAAABAAAAMAABAAAAMAAK
+    AAAAU0VBUkNIUEFUSAAKAAAAU0VBUkNIUEFUSAACAAAAADgAAABTRUxFQ1QgcGdfY2F0YWxvZy5z
+    ZXRfY29uZmlnKCdzZWFyY2hfcGF0aCcsICcnLCBmYWxzZSk7CgEBAAAAAQEAAAABAQAAAAEBAAAA
+    AQEAAAAAAAAAAAEBAAAAAAUAAABmYWxzZQEBAAAAAwAAAAAAAAAAANcAAAAAAAAAAAAEAAAAMTI1
+    OQAFAAAAMTYzODUABQAAAGl0ZW1zAAUAAABUQUJMRQACAAAAAEYAAABDUkVBVEUgVEFCTEUgcHVi
+    bGljLml0ZW1zICgKICAgIGlkIGludGVnZXIgTk9UIE5VTEwsCiAgICBuYW1lIHRleHQKKTsKABkA
+    AABEUk9QIFRBQkxFIHB1YmxpYy5pdGVtczsKAQEAAAAABgAAAHB1YmxpYwAAAAAAAAQAAABoZWFw
+    AHIAAAAACAAAAHBvc3RncmVzAAUAAABmYWxzZQEBAAAAAwAAAAAAAAAAACQNAAAAAQAAAAABAAAA
+    MAAFAAAAMTYzODUABQAAAGl0ZW1zAAoAAABUQUJMRSBEQVRBAAMAAAABAQAAAAEBAAAAACkAAABD
+    T1BZIHB1YmxpYy5pdGVtcyAoaWQsIG5hbWUpIEZST00gc3RkaW47CgAGAAAAcHVibGljAQEAAAAB
+    AQAAAAAAAAAAAAgAAABwb3N0Z3JlcwAFAAAAZmFsc2UAAwAAADIxNQEBAAAAAvYEAAAAAAAAAI8M
+    AAAAAAAAAAAEAAAAMjYwNgAFAAAAMTYzOTAAEAAAAGl0ZW1zIGl0ZW1zX3BrZXkACgAAAENPTlNU
+    UkFJTlQABAAAAABOAAAAQUxURVIgVEFCTEUgT05MWSBwdWJsaWMuaXRlbXMKICAgIEFERCBDT05T
+    VFJBSU5UIGl0ZW1zX3BrZXkgUFJJTUFSWSBLRVkgKGlkKTsKADoAAABBTFRFUiBUQUJMRSBPTkxZ
+    IHB1YmxpYy5pdGVtcyBEUk9QIENPTlNUUkFJTlQgaXRlbXNfcGtleTsKAQEAAAAABgAAAHB1Ymxp
+    YwAAAAAAAQEAAAAAAAAAAAAIAAAAcG9zdGdyZXMABQAAAGZhbHNlAAMAAAAyMTUBAQAAAAMAAAAA
+    AAAAAA==
+    EOF
+    printf '%s\n' 'AQAkDQAAACYAAAB4nDPkLEjN4zLizMzL5jLmLEgsSC1SSM7JLOCK0ePi4gIAfmgH3QAAAAAA' > data-gzip.b64
+    printf '%s\n' 'AQAkDQAAAC8AAAAEIk0YYECCIAAAAPAPMQlwZW4KMglpbmsKMwlwYXBlciBjbGlwClwuCgoKAAAAAAAAAAAA' > data-lz4.b64
+    printf '%s\n' 'AQAkDQAAACcAAAAotS/9IB7xAAAxCXBlbgoyCWluawozCXBhcGVyIGNsaXAKXC4KCgoAAAAAAA==' > data-zstd.b64
+    # PGDMP, archive version 1.16.0, 4-byte integers, 8-byte offsets, custom
+    # format and the compression method: 1 gzip, 2 lz4, 3 zstd.
+    archive() {
+      case $1 in
+        gzip) printf 'PGDMP\001\020\000\004\010\001\001' ;;
+        lz4) printf 'PGDMP\001\020\000\004\010\001\002' ;;
+        zstd) printf 'PGDMP\001\020\000\004\010\001\003' ;;
+      esac
+      cat toc.bin
+      base64 -d < "data-$1.b64"
+    }
+    same() {
+      cmp -s "$1" "$2" || { echo "$2:" >&2; cat "$2" >&2; echo "expected:" >&2; cat "$1" >&2; exit 1; }
+    }
+    printf '%s\n' '215; 1259 16385 TABLE public items postgres' \
+      '3364; 0 16385 TABLE DATA public items postgres' \
+      '3215; 2606 16390 CONSTRAINT public items items_pkey postgres' > list.expected
+    printf 'COPY public.items (id, name) FROM stdin;\n1\tpen\n2\tink\n3\tpaper clip\n\\.\n' > copy.expected
+    for algo in gzip lz4 zstd; do
+      archive "$algo" > "$algo.dump"
+      pg_restore -l "$algo.dump" > list.txt
+      grep -Fqx ";     Compression: $algo" list.txt || { cat list.txt >&2; exit 1; }
+      grep -E '^[0-9]+; ' list.txt > entries.txt || true
+      same list.expected entries.txt
+      pg_restore --restrict-key=fixture -f "$algo.sql" "$algo.dump"
+      awk '/^COPY public\.items /, /^\\\.$/' "$algo.sql" > copy.txt
+      same copy.expected copy.txt
+      for line in '\restrict fixture' 'CREATE TABLE public.items (' \
+          '    ADD CONSTRAINT items_pkey PRIMARY KEY (id);' '\unrestrict fixture'; do
+        grep -Fqx "$line" "$algo.sql" || { cat "$algo.sql" >&2; echo "missing: $line" >&2; exit 1; }
+      done
+      # From a pipe, pg_restore cannot seek and reads the archive in order.
+      archive "$algo" | pg_restore --restrict-key=fixture -f - > "$algo-piped.sql"
+      same "$algo.sql" "$algo-piped.sql"
+    done
+  - |
+    # A plain-format backup with a manifest as pg_basebackup writes it:
+    # CRC-32C and SHA-256 checksums of three files and one WAL range.
+    mkdir -p backup/base/5 backup/pg_wal
+    printf '18\n' > backup/PG_VERSION
+    head -c 8192 /dev/zero > backup/base/5/16385
+    printf "listen_addresses = '*'\n" > backup/postgresql.conf
+    printf '%s\n' \
+      '{ "PostgreSQL-Backup-Manifest-Version": 1,' \
+      '"Files": [' \
+      '{ "Path": "PG_VERSION", "Size": 3, "Last-Modified": "2026-10-14 09:30:00 GMT", "Checksum-Algorithm": "CRC32C", "Checksum": "994e7be2" },' \
+      '{ "Path": "base/5/16385", "Size": 8192, "Last-Modified": "2026-10-14 09:30:00 GMT", "Checksum-Algorithm": "SHA256", "Checksum": "9f1dcbc35c350d6027f98be0f5c8b43b42ca52b7604459c0c42be3aa88913d47" },' \
+      '{ "Path": "postgresql.conf", "Size": 23, "Last-Modified": "2026-10-14 09:30:00 GMT", "Checksum-Algorithm": "CRC32C", "Checksum": "419fc119" }' \
+      '],' \
+      '"WAL-Ranges": [' \
+      '{ "Timeline": 1, "Start-LSN": "0/2000028", "End-LSN": "0/2000120" }' \
+      '],' \
+      '"Manifest-Checksum": "f0a20ef0891cf73459ea28052d34e5e593a2a7eb0ebe0e745dd74c8236eafb5e"}' \
+      > backup/backup_manifest
+    pg_verifybackup --no-parse-wal backup > verify.txt
+    if [ "$(cat verify.txt)" != 'backup successfully verified' ]; then cat verify.txt >&2; exit 1; fi
+    fails() {
+      rc=0
+      pg_verifybackup "$@" backup > out.txt 2>&1 || rc=$?
+      if [ "$rc" != 1 ] || ! grep -Fq "$expected" out.txt; then
+        echo "expected exit status 1 and: $expected" >&2; echo "got ($rc):" >&2; cat out.txt >&2; exit 1
+      fi
+    }
+    # pg_verifybackup runs pg_waldump, which finds no WAL in pg_wal.
+    expected='WAL parsing failed for timeline 1'
+    fails
+    { head -c 8191 /dev/zero; printf x; } > backup/base/5/16385
+    expected='checksum mismatch for file "base/5/16385"'
+    fails --no-parse-wal
+examples:
+  - title: Open psql on a database
+    command: docker run --rm -it ghcr.io/randomcontainers/postgresql-client -h db.example.com -U app shop
+  - title: Dump a database to a compressed archive
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -e PGPASSWORD --entrypoint pg_dump ghcr.io/randomcontainers/postgresql-client -h db.example.com -U app -Fc -f shop.dump shop
+  - title: Restore an archive into an existing database
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -e PGPASSWORD --entrypoint pg_restore ghcr.io/randomcontainers/postgresql-client -h db.example.com -U app -d shop --no-owner shop.dump
+  - title: Check whether a server accepts connections
+    command: docker run --rm --entrypoint pg_isready ghcr.io/randomcontainers/postgresql-client -h db.example.com
