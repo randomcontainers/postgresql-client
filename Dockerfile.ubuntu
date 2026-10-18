@@ -1,0 +1,192 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS source
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends bzip2; \
+    rm -rf /var/lib/apt/lists/*
+ARG VERSION
+ARG SOURCE_SHA256
+# PostgreSQL publishes a .sha256 file next to each tarball but no signature.
+ADD --checksum=sha256:${SOURCE_SHA256} https://ftp.postgresql.org/pub/source/v${VERSION}/postgresql-${VERSION}.tar.bz2 /src/
+WORKDIR /src
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    mkdir postgresql; \
+    tar -xjf "postgresql-${VERSION}.tar.bz2" -C postgresql --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's own packages are recorded first so they can be left out of
+# runtime-deps; every image built from this list starts from the same base.
+# Since PostgreSQL 17 the tarball has no generated parsers, so bison, flex and
+# perl are needed. GNU readline is not installed, so psql can only use libedit.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      bison \
+      build-essential \
+      flex \
+      libedit-dev \
+      libkrb5-dev \
+      liblz4-dev \
+      libssl-dev \
+      libzstd-dev \
+      perl \
+      pkgconf \
+      zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*
+COPY --link --from=source /src/postgresql /src/postgresql
+WORKDIR /src/postgresql
+ARG JOBS
+# Only the client programs and libpq are built; make in one of their
+# directories first generates the headers it needs from the server tree.
+# configure stops when a library it is asked for is missing, and the
+# pg_config.h check catches what it would choose on its own. ICU is only used
+# by the server. The programs get a RUNPATH of /usr/local/lib from configure.
+# pg_waldump is a server tool, but pg_verifybackup runs it to check the WAL of
+# a backup.
+RUN ./configure \
+      --prefix=/usr/local \
+      --enable-option-checking=fatal \
+      --with-gssapi \
+      --with-libedit-preferred \
+      --with-lz4 \
+      --with-ssl=openssl \
+      --with-zstd \
+      --without-icu; \
+    wrong=; \
+    for d in ENABLE_GSS HAVE_EDITLINE_READLINE_H HAVE_LIBREADLINE HAVE_LIBZ USE_LZ4 USE_OPENSSL USE_ZSTD; do \
+      grep -qx "#define $d 1" src/include/pg_config.h || wrong="$wrong, $d missing"; \
+    done; \
+    for d in ENABLE_NLS HAVE_READLINE_READLINE_H USE_ICU USE_LDAP USE_LIBCURL; do \
+      if grep -qx "#define $d 1" src/include/pg_config.h; then wrong="$wrong, $d set"; fi; \
+    done; \
+    if [ -n "$wrong" ]; then echo "pg_config.h: ${wrong#, }" >&2; exit 1; fi; \
+    make -C src/interfaces/libpq -j"${JOBS:-$(nproc)}"; \
+    for d in pg_amcheck pg_basebackup pg_combinebackup pg_dump pg_verifybackup pg_waldump pgbench psql scripts; do \
+      make -C "src/bin/$d" -j"${JOBS:-$(nproc)}"; \
+    done
+
+ARG BASE_IMAGE
+ARG VERSION
+ARG SOURCE_SHA256
+# pg_createsubscriber, which comes with pg_basebackup, sets up a server's data
+# directory and is left out with the other server tools. The headers, the
+# static library, the pkg-config file and the sample config files go, and so
+# does libpq.so, which only a compiler uses.
+# Code compiled in under other licenses keeps its notices: those of the
+# src/port files that were built (snprintf.c, pgmkdirp.c, bsearch_arg.c,
+# inet_net_ntop.c and replacements for functions the C library lacks), the
+# qsort template, the fasthash code in hashfn_unstable.h, and
+# pg_backup_archiver.c for the archive code of pg_dump and pg_restore. A notice
+# that is not BSD-3-Clause, ISC or MIT stops the build until the license in
+# package.yml is checked. licenses/ holds two texts the tarball lacks: the
+# Unicode License v3, for the tables in libpq and psql that are generated from
+# the Unicode Character Database, and the MIT license of fast-crc32, which
+# generated CRC-32C code in src/port without a notice. It is copied when a
+# src/port file that was built contains such code, which depends on the
+# platform.
+# runtime-deps lists the packages that own the libraries the programs load,
+# minus the base image's packages, plus the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses,target=/tmp/licenses.extra \
+    make -C src/interfaces/libpq install-strip DESTDIR=/out; \
+    for d in pg_amcheck pg_basebackup pg_combinebackup pg_dump pg_verifybackup pg_waldump pgbench psql scripts; do \
+      make -C "src/bin/$d" install-strip DESTDIR=/out; \
+    done; \
+    rm -rf /out/usr/local/include /out/usr/local/lib/pkgconfig /out/usr/local/share/postgresql; \
+    rm -f /out/usr/local/bin/pg_createsubscriber /out/usr/local/lib/libpq.a /out/usr/local/lib/libpq.so; \
+    rmdir /out/usr/local/share; \
+    dirs=; \
+    for f in /out/usr/local/*; do dirs="$dirs ${f##*/}"; done; \
+    test "$dirs" = ' bin lib' || { echo "unexpected in /out/usr/local:$dirs" >&2; exit 1; }; \
+    bins=; \
+    for f in /out/usr/local/bin/*; do bins="$bins ${f##*/}"; done; \
+    expected=' clusterdb createdb createuser dropdb dropuser pg_amcheck pg_basebackup pg_combinebackup pg_dump pg_dumpall pg_isready pg_receivewal pg_recvlogical pg_restore pg_verifybackup pg_waldump pgbench psql reindexdb vacuumdb'; \
+    if [ "$bins" != "$expected" ]; then echo "unexpected programs:$bins" >&2; exit 1; fi; \
+    test -L /out/usr/local/lib/libpq.so.5; \
+    for f in /out/usr/local/lib/*; do \
+      case "${f##*/}" in libpq.so.5|libpq.so.5.[0-9]*) ;; *) echo "unexpected file: $f" >&2; exit 1 ;; esac; \
+    done; \
+    readelf -d /out/usr/local/bin/psql > /tmp/psql-dynamic; \
+    grep -Eq '\(RUNPATH\) +Library runpath: \[/usr/local/lib\]$' /tmp/psql-dynamic \
+      || { cat /tmp/psql-dynamic >&2; exit 1; }; \
+    export LD_LIBRARY_PATH=/out/usr/local/lib; \
+    test "$(/out/usr/local/bin/psql --version)" = "psql (PostgreSQL) ${VERSION}"; \
+    meta=/out/usr/local/share/randomcontainers/postgresql-client; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYRIGHT "$meta/licenses/"; \
+    notice() { \
+      awk -v re="$1" '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ re) printf "%s\n", b }' "$2"; \
+    }; \
+    terms='Redistribution and use|Permission to use|Permission is hereby granted'; \
+    for c in src/port/*.c; do \
+      f="${c##*/}"; f="${f%.c}"; \
+      if [ -e "src/port/$f.o" ]; then \
+        notice "$terms" "$c" > "$meta/licenses/LICENSE.$f"; \
+        if [ ! -s "$meta/licenses/LICENSE.$f" ]; then rm "$meta/licenses/LICENSE.$f"; fi; \
+        if grep -q 'github\.com/corsix/fast-crc32' "$c"; then \
+          cp /tmp/licenses.extra/LICENSE.fast-crc32 "$meta/licenses/"; \
+        fi; \
+      fi; \
+    done; \
+    notice "$terms" src/include/lib/sort_template.h > "$meta/licenses/LICENSE.qsort"; \
+    notice "$terms" src/include/common/hashfn_unstable.h > "$meta/licenses/LICENSE.fasthash"; \
+    for f in snprintf pgmkdirp bsearch_arg inet_net_ntop qsort fasthash; do \
+      test -s "$meta/licenses/LICENSE.$f" || { echo "no notice for $f" >&2; exit 1; }; \
+    done; \
+    grep -q 'Zilong Tan' "$meta/licenses/LICENSE.fasthash"; \
+    for f in "$meta"/licenses/LICENSE.*; do \
+      if grep -q 'advertising materials' "$f" \
+          || ! grep -Eq 'Neither the name of the University|Permission to use, copy, modify, and distribute this software for any|Permission is hereby granted, free of charge' "$f"; then \
+        echo "${f##*/}: check the license label in package.yml" >&2; exit 1; \
+      fi; \
+    done; \
+    notice 'Rights are granted' src/bin/pg_dump/pg_backup_archiver.c > "$meta/licenses/LICENSE.pg_dump"; \
+    grep -q 'Philip Warner' "$meta/licenses/LICENSE.pg_dump"; \
+    cp /tmp/licenses.extra/Unicode-3.0 "$meta/licenses/Unicode-3.0"; \
+    grep -q 'UNICODE LICENSE V3' "$meta/licenses/Unicode-3.0"; \
+    echo "${VERSION}" > "$meta/version"; \
+    echo "https://ftp.postgresql.org/pub/source/v${VERSION}/postgresql-${VERSION}.tar.bz2" > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "configure: $(sed -n 's/^  \$ \.\/configure //p' config.log)"; \
+      echo "libraries: $(sed -n 's/^LIBS = //p' src/Makefile.global)"; \
+      echo "port replacements: $(sed -n 's/^LIBOBJS = //p' src/Makefile.global)"; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    if grep 'libreadline' /tmp/ldd; then echo "GNU readline is linked" >&2; exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/(out\/)?usr\/local\// { print $3 }' /tmp/ldd | LC_ALL=C sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --link --from=build /out/usr/local/ /usr/local/
+# The programs find libpq in /usr/local/lib through their RUNPATH; ldconfig
+# adds it to the loader cache for everything else.
+RUN set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/postgresql-client/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "psql"]
+CMD ["--help"]
