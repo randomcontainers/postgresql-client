@@ -26,14 +26,14 @@ upstream:
   # directory. The index gives no time zone.
   pattern: 'href="v(?P<version>\d+\.\d+)/">[^<]*</a> +(?P<date>\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2})'
   versioning: semver
-  version: "18.7"
+  version: "19.0"
   cooldown: 48h
   artifact:
     url: https://ftp.postgresql.org/pub/source/v{version}/postgresql-{version}.tar.bz2
     checksums:
       url: https://ftp.postgresql.org/pub/source/v{version}/postgresql-{version}.tar.bz2.sha256
       algorithm: sha256
-    sha256: 441dfae4280cae3e0425e5f876f80559fb0731c140f1aae22b3e5a54d0411bfd
+    sha256: a89fd70efbad6a08c7dbed8d4872e3af30170d9e5ca9dc7906523be95b4e692d
 image:
   entrypoint: [psql]
   cmd: [--help]
