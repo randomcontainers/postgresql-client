@@ -181,7 +181,7 @@ COPY --link --from=build /out/usr/local/ /usr/local/
 # adds it to the loader cache for everything else.
 RUN set -eu; \
     apt-get update; \
-    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/postgresql-client/runtime-deps; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini tzdata < /usr/local/share/randomcontainers/postgresql-client/runtime-deps; \
     rm -rf /var/lib/apt/lists/*; \
     ldconfig; \
     install -d -m 1777 /work /cache

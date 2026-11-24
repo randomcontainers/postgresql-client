@@ -163,7 +163,7 @@ RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra 
 FROM ${BASE_IMAGE} AS slim
 COPY --link --from=build /out/usr/local/ /usr/local/
 RUN set -eu; \
-    xargs apk add --no-cache ca-certificates tini < /usr/local/share/randomcontainers/postgresql-client/runtime-deps; \
+    xargs apk add --no-cache ca-certificates tini tzdata < /usr/local/share/randomcontainers/postgresql-client/runtime-deps; \
     addgroup -g 1000 app; \
     adduser -D -u 1000 -G app app; \
     install -d -m 1777 /work /cache
